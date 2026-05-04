@@ -1,0 +1,15 @@
+services:
+  image: swift-deploy-1-node:latest
+  port: 3000
+  mode: stable
+  version: "1.0.0"
+  restart_policy: unless-stopped
+  proxy_timeout: 30
+
+nginx:
+  image: nginx:latest
+  port: 8080
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
