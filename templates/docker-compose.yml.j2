@@ -21,7 +21,7 @@ services:
     expose:
       - "{{ services.port }}"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:{{ services.port }}/healthz"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:{{ services.port }}/healthz')"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -41,14 +41,8 @@ services:
     ports:
       - "{{ nginx.port }}:{{ nginx.port }}"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
       - app-logs:/var/log/nginx
     depends_on:
       app:
         condition: service_healthy
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true

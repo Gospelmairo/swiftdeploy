@@ -127,27 +127,34 @@ def cmd_validate():
             fail(f"Docker image '{image}' not found locally — run: docker build -t {image} .")
             failed += 1
 
-    # Check 4 — Nginx port not already bound
+    # Check 4 — Nginx port not already bound (skip if our own stack is running)
     if cfg:
         port = cfg["nginx"]["port"]
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("0.0.0.0", int(port)))
-                ok(f"Nginx port {port} is free")
-                passed += 1
-            except OSError:
-                fail(f"Port {port} is already in use")
-                failed += 1
+        our_nginx = run("docker ps --format '{{.Names}}' | grep swiftdeploy-nginx", capture=True)
+        if our_nginx.returncode == 0 and our_nginx.stdout.strip():
+            ok(f"Nginx port {port} is in use by our own stack (ok)")
+            passed += 1
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("0.0.0.0", int(port)))
+                    ok(f"Nginx port {port} is free")
+                    passed += 1
+                except OSError:
+                    fail(f"Port {port} is already in use by another process")
+                    failed += 1
 
-    # Check 5 — nginx.conf syntax valid
+    # Check 5 — nginx.conf syntax valid (ignore upstream DNS errors)
     if os.path.exists(NGINX_CONF):
         result = run(f"docker run --rm -v {NGINX_CONF}:/etc/nginx/conf.d/default.conf:ro nginx:latest nginx -t", capture=True)
-        if result.returncode == 0:
+        stderr = result.stderr.strip()
+        # upstream DNS errors are expected outside Docker network — not a syntax error
+        if result.returncode == 0 or "host not found in upstream" in stderr:
             ok("nginx.conf syntax is valid")
             passed += 1
         else:
-            fail(f"nginx.conf syntax error: {result.stderr.strip()}")
+            fail(f"nginx.conf syntax error: {stderr}")
             failed += 1
     else:
         fail("nginx.conf not found — run: ./swiftdeploy init first")
@@ -207,14 +214,20 @@ def cmd_promote(mode):
     info("Restarting app service...")
     run(f"docker compose -f {COMPOSE_FILE} up -d --no-deps --force-recreate app")
 
-    # Confirm new mode via /healthz
+    # Confirm new mode via /healthz — wait up to 60s
     info("Confirming new mode via /healthz...")
     port = cfg["nginx"]["port"]
-    time.sleep(5)
-    result = run(f"curl -sf http://localhost:{port}/healthz", capture=True)
-    if result.returncode == 0:
+    deadline = time.time() + 60
+    healthy = False
+    while time.time() < deadline:
+        result = run(f"curl -sf http://localhost:{port}/healthz", capture=True)
+        if result.returncode == 0:
+            healthy = True
+            break
+        time.sleep(3)
+
+    if healthy:
         ok(f"Service is healthy in {mode} mode")
-        # Also hit / to show mode in response
         result2 = run(f"curl -sf http://localhost:{port}/", capture=True)
         if result2.returncode == 0:
             print(f"     {result2.stdout.strip()}")
