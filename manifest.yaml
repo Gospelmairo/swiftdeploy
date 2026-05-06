@@ -4,9 +4,12 @@ network:
 nginx:
   image: nginx:latest
   port: 8080
+opa:
+  image: openpolicyagent/opa:latest
+  port: 8181
 services:
   image: swift-deploy-1-node:latest
-  mode: canary
+  mode: stable
   port: 3000
   proxy_timeout: 30
   restart_policy: unless-stopped

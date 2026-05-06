@@ -4,12 +4,15 @@ swiftdeploy — declarative container deployment CLI.
 Usage: ./swiftdeploy <subcommand>
 """
 
+import json
 import os
 import sys
 import time
 import subprocess
 import socket
 import shutil
+import tempfile
+import urllib.request
 
 import yaml
 from jinja2 import Environment, FileSystemLoader
@@ -19,6 +22,8 @@ MANIFEST = os.path.join(ROOT, "manifest.yaml")
 TEMPLATES_DIR = os.path.join(ROOT, "templates")
 NGINX_CONF = os.path.join(ROOT, "nginx.conf")
 COMPOSE_FILE = os.path.join(ROOT, "docker-compose.yml")
+POLICIES_DIR = os.path.join(ROOT, "policies")
+HISTORY_FILE = os.path.join(ROOT, "history.jsonl")
 
 
 # ─────────────────────────────────────────────
@@ -48,9 +53,113 @@ def run(cmd, capture=False):
         subprocess.run(cmd, shell=True, check=True)
 
 
-def ok(msg):  print(f"  \033[32m✔\033[0m  {msg}")
+def ok(msg):   print(f"  \033[32m✔\033[0m  {msg}")
 def fail(msg): print(f"  \033[31m✘\033[0m  {msg}")
 def info(msg): print(f"  \033[34m→\033[0m  {msg}")
+
+
+# ─────────────────────────────────────────────
+# OPA / metrics helpers
+# ─────────────────────────────────────────────
+
+def collect_host_stats():
+    """Return disk_free_gb and cpu_load_1m for the infrastructure OPA policy."""
+    disk = shutil.disk_usage("/")
+    disk_free_gb = disk.free / (1024 ** 3)
+    try:
+        cpu_load_1m = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        cpu_load_1m = 0.0
+    return {"disk_free_gb": round(disk_free_gb, 2), "cpu_load_1m": round(cpu_load_1m, 2)}
+
+
+def scrape_metrics(port):
+    """Scrape /metrics and return error_rate_pct, p99_ms, total_requests (or None on failure)."""
+    try:
+        url = f"http://localhost:{port}/metrics"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            text = resp.read().decode()
+    except Exception:
+        return None
+
+    total = 0.0
+    errors = 0.0
+    for line in text.splitlines():
+        if line.startswith("http_requests_total{") and not line.startswith("#"):
+            try:
+                count = float(line.rsplit(" ", 1)[-1])
+                total += count
+                if 'status_code="5' in line:
+                    errors += count
+            except ValueError:
+                pass
+
+    # Parse histogram buckets for P99
+    buckets = []
+    inf_count = 0.0
+    for line in text.splitlines():
+        if line.startswith("http_request_duration_seconds_bucket{"):
+            try:
+                le = line.split('le="')[1].split('"')[0]
+                count = float(line.rsplit(" ", 1)[-1])
+                if le == "+Inf":
+                    inf_count = count
+                else:
+                    buckets.append((float(le), count))
+            except (IndexError, ValueError):
+                pass
+
+    p99_ms = 0.0
+    if buckets and inf_count > 0:
+        target = inf_count * 0.99
+        for le, count in sorted(buckets):
+            if count >= target:
+                p99_ms = le * 1000
+                break
+
+    return {
+        "error_rate_pct": round((errors / total * 100) if total > 0 else 0.0, 2),
+        "p99_ms": round(p99_ms, 2),
+        "total_requests": int(total),
+    }
+
+
+def opa_check(policy_name, package_name, input_data):
+    """Run OPA eval against a .rego file. Returns list of denial messages (empty = allowed)."""
+    policy_path = os.path.join(POLICIES_DIR, policy_name)
+    if not os.path.exists(policy_path):
+        info(f"OPA policy not found: {policy_path} — skipping")
+        return []
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(input_data, f)
+        input_file = f.name
+
+    try:
+        cmd = (
+            f"docker run --rm "
+            f"-v '{policy_path}':/policy.rego:ro "
+            f"-v '{input_file}':/input.json:ro "
+            f"openpolicyagent/opa:latest "
+            f"eval --data /policy.rego --input /input.json "
+            f"'data.{package_name}.deny'"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            first_line = (result.stderr or "unknown error").splitlines()[0]
+            info(f"OPA eval failed: {first_line}")
+            return None
+        output = json.loads(result.stdout)
+        denials = output["result"][0]["expressions"][0]["value"]
+        return denials if denials else []
+    except Exception as e:
+        info(f"OPA check error: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(input_file)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -65,12 +174,12 @@ def cmd_init():
     nginx_content = render_template("nginx.conf.j2", cfg)
     with open(NGINX_CONF, "w") as f:
         f.write(nginx_content)
-    ok(f"Generated nginx.conf")
+    ok("Generated nginx.conf")
 
     compose_content = render_template("docker-compose.yml.j2", cfg)
     with open(COMPOSE_FILE, "w") as f:
         f.write(compose_content)
-    ok(f"Generated docker-compose.yml")
+    ok("Generated docker-compose.yml")
 
     print()
 
@@ -147,9 +256,11 @@ def cmd_validate():
 
     # Check 5 — nginx.conf syntax valid (ignore upstream DNS errors)
     if os.path.exists(NGINX_CONF):
-        result = run(f"docker run --rm -v {NGINX_CONF}:/etc/nginx/conf.d/default.conf:ro nginx:latest nginx -t", capture=True)
+        result = run(
+            f"docker run --rm -v {NGINX_CONF}:/etc/nginx/conf.d/default.conf:ro nginx:latest nginx -t",
+            capture=True,
+        )
         stderr = result.stderr.strip()
-        # upstream DNS errors are expected outside Docker network — not a syntax error
         if result.returncode == 0 or "host not found in upstream" in stderr:
             ok("nginx.conf syntax is valid")
             passed += 1
@@ -167,8 +278,23 @@ def cmd_validate():
 
 
 def cmd_deploy():
-    """Run init, bring up stack, wait for health"""
+    """OPA infrastructure check → init → bring up stack → wait for health"""
     print("\n[swiftdeploy] deploy")
+
+    info("Running OPA infrastructure policy check...")
+    stats = collect_host_stats()
+    info(f"  disk_free: {stats['disk_free_gb']:.1f} GB   cpu_load_1m: {stats['cpu_load_1m']:.2f}")
+    denials = opa_check("infrastructure.rego", "infrastructure", stats)
+    if denials is None:
+        info("OPA unavailable — proceeding without infrastructure block (fail open)")
+    elif denials:
+        for msg in denials:
+            fail(f"OPA denied: {msg}")
+        print()
+        sys.exit(1)
+    else:
+        ok("Infrastructure policy passed")
+
     cmd_init()
 
     info("Starting stack...")
@@ -193,30 +319,52 @@ def cmd_deploy():
 
 
 def cmd_promote(mode):
-    """Switch deployment mode: stable or canary"""
+    """OPA canary check → switch deployment mode: stable or canary"""
     if mode not in ("stable", "canary"):
         print("Usage: ./swiftdeploy promote [stable|canary]")
         sys.exit(1)
 
     print(f"\n[swiftdeploy] promote → {mode}")
     cfg = load_manifest()
+    port = cfg["nginx"]["port"]
+
+    # Pre-promote OPA canary check
+    info("Running OPA canary policy check...")
+    metrics_data = scrape_metrics(port)
+    if metrics_data is None:
+        info("Could not scrape /metrics — skipping canary check")
+    else:
+        info(
+            f"  error_rate: {metrics_data['error_rate_pct']:.2f}%"
+            f"  p99: {metrics_data['p99_ms']:.0f}ms"
+            f"  total_requests: {metrics_data['total_requests']}"
+        )
+        denials = opa_check("canary.rego", "canary", metrics_data)
+        if denials is None:
+            info("OPA unavailable — proceeding without canary block (fail open)")
+        elif denials:
+            for msg in denials:
+                fail(f"OPA denied: {msg}")
+            print()
+            sys.exit(1)
+        else:
+            ok("Canary policy passed")
+    if metrics_data is None:
+        ok("Canary check skipped (metrics unavailable)")
+
     cfg["services"]["mode"] = mode
     save_manifest(cfg)
     ok(f"manifest.yaml updated — mode: {mode}")
 
-    # Regenerate docker-compose.yml with new MODE
     compose_content = render_template("docker-compose.yml.j2", cfg)
     with open(COMPOSE_FILE, "w") as f:
         f.write(compose_content)
     ok("docker-compose.yml regenerated")
 
-    # Restart only the app service
     info("Restarting app service...")
     run(f"docker compose -f {COMPOSE_FILE} up -d --no-deps --force-recreate app")
 
-    # Confirm new mode via /healthz — wait up to 60s
     info("Confirming new mode via /healthz...")
-    port = cfg["nginx"]["port"]
     deadline = time.time() + 60
     healthy = False
     while time.time() < deadline:
@@ -254,6 +402,167 @@ def cmd_teardown(clean=False):
     print()
 
 
+def cmd_status():
+    """Live terminal dashboard — print current stack state and append snapshot to history.jsonl"""
+    print("\n[swiftdeploy] status")
+
+    cfg = load_manifest()
+    port = cfg["nginx"]["port"]
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Container status via docker ps
+    ps_result = run(
+        "docker ps --filter name=swiftdeploy --format '{{.Names}}\t{{.Status}}'",
+        capture=True,
+    )
+    containers = []
+    if ps_result.returncode == 0:
+        for line in ps_result.stdout.strip().splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                containers.append({"name": parts[0], "status": parts[1]})
+
+    # Health check
+    health_result = run(f"curl -sf http://localhost:{port}/healthz", capture=True)
+    healthy = health_result.returncode == 0
+
+    # Scrape /metrics
+    metrics_data = scrape_metrics(port) or {}
+    mode = cfg["services"].get("mode", "stable")
+    uptime = 0.0
+    chaos_str = "none"
+
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=3) as resp:
+            for line in resp.read().decode().splitlines():
+                if line.startswith("app_uptime_seconds "):
+                    uptime = float(line.split()[-1])
+                elif line.startswith("chaos_active "):
+                    cv = int(float(line.split()[-1]))
+                    chaos_str = {0: "none", 1: "slow", 2: "error"}.get(cv, "unknown")
+                elif line.startswith("app_mode{") and 'mode="' in line:
+                    mode = line.split('mode="')[1].split('"')[0]
+    except Exception:
+        pass
+
+    # Print dashboard
+    bar = "─" * 52
+    print(f"\n  {bar}")
+    print(f"  {'SwiftDeploy Status Dashboard':^52}")
+    print(f"  {bar}")
+    print(f"  {'Timestamp':<24} {timestamp}")
+    print(f"  {'Nginx port':<24} {port}")
+    print(f"  {'App mode':<24} {mode}")
+    print(f"  {'App uptime':<24} {uptime:.0f}s")
+    print(f"  {'Stack healthy':<24} {'yes' if healthy else 'no'}")
+    print(f"  {'Total requests':<24} {metrics_data.get('total_requests', 0)}")
+    print(f"  {'Error rate':<24} {metrics_data.get('error_rate_pct', 0.0):.2f}%")
+    print(f"  {'P99 latency':<24} {metrics_data.get('p99_ms', 0.0):.0f}ms")
+    print(f"  {'Chaos active':<24} {chaos_str}")
+    print(f"  {bar}")
+    if containers:
+        print(f"  Containers:")
+        for c in containers:
+            icon = "\033[32m✔\033[0m" if "Up" in c["status"] else "\033[31m✘\033[0m"
+            print(f"    {icon}  {c['name']:<38} {c['status']}")
+    else:
+        print("  No swiftdeploy containers running")
+    print(f"  {bar}")
+
+    # Append snapshot to history.jsonl
+    snapshot = {
+        "timestamp": timestamp,
+        "mode": mode,
+        "uptime_seconds": round(uptime),
+        "total_requests": metrics_data.get("total_requests", 0),
+        "error_rate_pct": metrics_data.get("error_rate_pct", 0.0),
+        "p99_ms": metrics_data.get("p99_ms", 0.0),
+        "chaos": chaos_str,
+        "healthy": healthy,
+    }
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(snapshot) + "\n")
+
+    ok("Snapshot appended to history.jsonl")
+    print()
+
+
+def cmd_audit():
+    """Generate audit_report.md from history.jsonl"""
+    print("\n[swiftdeploy] audit")
+
+    if not os.path.exists(HISTORY_FILE):
+        fail("history.jsonl not found — run: ./swiftdeploy status first")
+        sys.exit(1)
+
+    snapshots = []
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    snapshots.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    if not snapshots:
+        fail("No snapshots in history.jsonl")
+        sys.exit(1)
+
+    first_ts = snapshots[0]["timestamp"]
+    last_ts = snapshots[-1]["timestamp"]
+    total_snaps = len(snapshots)
+    healthy_snaps = sum(1 for s in snapshots if s.get("healthy"))
+    uptime_pct = healthy_snaps / total_snaps * 100
+    peak_requests = max(s.get("total_requests", 0) for s in snapshots)
+    peak_error_rate = max(s.get("error_rate_pct", 0.0) for s in snapshots)
+    modes_seen = sorted({s.get("mode", "?") for s in snapshots})
+    chaos_events = [s for s in snapshots if s.get("chaos", "none") != "none"]
+
+    report_lines = [
+        "# SwiftDeploy Audit Report",
+        "",
+        f"Generated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Observation window | {first_ts} → {last_ts} |",
+        f"| Total snapshots | {total_snaps} |",
+        f"| Availability | {uptime_pct:.1f}% |",
+        f"| Modes observed | {', '.join(modes_seen)} |",
+        f"| Peak total requests | {peak_requests} |",
+        f"| Peak error rate | {peak_error_rate:.2f}% |",
+        f"| Chaos events recorded | {len(chaos_events)} |",
+        "",
+        "## Snapshot Log",
+        "",
+        "| Timestamp | Mode | Healthy | Requests | Error Rate | P99 (ms) | Chaos |",
+        "|-----------|------|---------|----------|------------|----------|-------|",
+    ]
+
+    for s in snapshots:
+        icon = "✔" if s.get("healthy") else "✘"
+        report_lines.append(
+            f"| {s['timestamp']} | {s.get('mode','?')} | {icon} "
+            f"| {s.get('total_requests',0)} | {s.get('error_rate_pct',0.0):.2f}% "
+            f"| {s.get('p99_ms',0.0):.0f} | {s.get('chaos','?')} |"
+        )
+
+    if chaos_events:
+        report_lines += ["", "## Chaos Event Log", ""]
+        for e in chaos_events:
+            report_lines.append(f"- `{e['timestamp']}` — chaos mode: **{e['chaos']}**")
+
+    report_file = os.path.join(ROOT, "audit_report.md")
+    with open(report_file, "w") as f:
+        f.write("\n".join(report_lines) + "\n")
+
+    ok(f"audit_report.md generated ({total_snaps} snapshots, {len(chaos_events)} chaos events)")
+    print()
+
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
@@ -264,10 +573,12 @@ swiftdeploy — declarative container deployment CLI
 Usage:
   ./swiftdeploy init              Generate nginx.conf + docker-compose.yml from manifest
   ./swiftdeploy validate          Run 5 pre-flight checks
-  ./swiftdeploy deploy            Init + bring stack up + wait for health
-  ./swiftdeploy promote <mode>    Switch mode: stable or canary
+  ./swiftdeploy deploy            OPA infra check + init + bring stack up + wait for health
+  ./swiftdeploy promote <mode>    OPA canary check + switch mode: stable or canary
   ./swiftdeploy teardown          Remove all containers, networks, volumes
   ./swiftdeploy teardown --clean  Also delete generated config files
+  ./swiftdeploy status            Print live dashboard + append snapshot to history.jsonl
+  ./swiftdeploy audit             Generate audit_report.md from history.jsonl
 """
 
 if __name__ == "__main__":
@@ -291,6 +602,10 @@ if __name__ == "__main__":
         cmd_promote(args[1])
     elif cmd == "teardown":
         cmd_teardown(clean="--clean" in args)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "audit":
+        cmd_audit()
     else:
         print(f"Unknown command: {cmd}")
         print(USAGE)

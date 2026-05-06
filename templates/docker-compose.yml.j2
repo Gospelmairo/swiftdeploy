@@ -42,3 +42,14 @@ services:
     depends_on:
       app:
         condition: service_healthy
+
+  opa:
+    image: {{ opa.image }}
+    restart: {{ services.restart_policy }}
+    networks:
+      - {{ network.name }}
+    command: ["run", "--server", "--addr=0.0.0.0:{{ opa.port }}", "/policies"]
+    volumes:
+      - ./policies:/policies:ro
+    ports:
+      - "{{ opa.port }}:{{ opa.port }}"

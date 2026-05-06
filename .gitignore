@@ -3,3 +3,5 @@ docker-compose.yml
 __pycache__/
 *.pyc
 .env
+history.jsonl
+audit_report.md
